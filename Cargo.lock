@@ -838,6 +838,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "inscript"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argh",
+ "async-trait",
+ "bitcoin 0.31.2",
+ "bitcoincore-rpc",
+ "bitcoincore-rpc-json",
+ "clap",
+ "env_logger",
+ "hex",
+ "log",
+ "ord-rs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1005,27 +1026,6 @@ dependencies = [
  "serde_json",
  "serde_with",
  "thiserror",
-]
-
-[[package]]
-name = "ord-rs-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argh",
- "async-trait",
- "bitcoin 0.31.2",
- "bitcoincore-rpc",
- "bitcoincore-rpc-json",
- "clap",
- "env_logger",
- "hex",
- "log",
- "ord-rs",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
