@@ -1,16 +1,27 @@
+
+
 use std::collections::HashMap;
+use std::fmt::{format, Debug, Display, Formatter};
+use std::os::unix::fs::chown;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use bitcoin::{Address, Amount, Transaction, Txid};
 use bitcoin::p2p::message::NetworkMessage::Tx;
 use bitcoincore_rpc::jsonrpc::minreq::head;
+use chrono::TimeDelta;
+use clap::builder::Str;
 use log::{debug, info};
 use ord_rs::wallet::Utxo;
 use reqwest::header::HeaderMap;
 use reqwest::Url;
-use crate::init::API_KEY;
+
+
+pub static mut API_KEY: OnceLock<String> = OnceLock::new();
+pub static mut MAX_COMMIT_FEE: u64 = 0;
+pub static mut MAX_REVEAL_FEE: u64 = 0;
 
 #[derive(Copy, Clone)]
 pub enum Network {
@@ -30,7 +41,20 @@ impl FromStr for Network {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+
+#[derive(Debug)]
+pub struct Timeout;
+
+
+impl Display for Timeout {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timeout")
+    }
+}
+
+impl core::error::Error for Timeout {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Fees {
     #[serde(alias = "economyFee")]
     pub economy_fee: usize,
@@ -72,16 +96,16 @@ pub struct Brc20Fee {
 }
 pub fn get_max_brc20_tx_fee(network: Network) -> (Brc20Fee) {
     Brc20Fee {
-        commit_fee: Amount::from_sat(2_500),
-        reveal_fee: Amount::from_sat(3_000),
+        commit_fee: Amount::from_sat(unsafe { MAX_COMMIT_FEE }),
+        reveal_fee: Amount::from_sat(unsafe { MAX_REVEAL_FEE }),
     }
 }
 
 pub struct RpcClient;
 
 impl RpcClient {
-    const TESTNET_API_KEY: &'static str = "7e314c5fac4659513bb478964f9146fa8853c8331300cc82ed3e7d4ceedc2288";
-    const MAINNET_API_KEY: &'static str = "260d2ddac3756d53f46685ff86f60bf473197da86eeb28f71bba46220358f652";
+    // const TESTNET_API_KEY: &'static str = "7e314c5fac4659513bb478964f9146fa8853c8331300cc82ed3e7d4ceedc2288";
+    // const MAINNET_API_KEY: &'static str = "260d2ddac3756d53f46685ff86f60bf473197da86eeb28f71bba46220358f652";
 
     pub fn get_api_key(network: Network) -> String {
         unsafe {
@@ -220,13 +244,27 @@ impl RpcClient {
     }
 
     pub async fn wait_for_tx(txid: &Txid, network: Network, timeout: Duration) -> anyhow::Result<()> {
+        let start = chrono::Local::now();
+        let delta = TimeDelta::from_std(timeout).unwrap();
+
+        info!("waiting for transaction to be confirmed. txid: {}",txid);
+
+
         loop {
-            info!("waiting for transaction to be confirmed. txid: {}",txid);
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            if Self::get_tx_by_hash(txid, network).await.is_ok() {
-                break;
+            let tx_res = Self::get_tx_by_hash(txid, network).await;
+            if tx_res.is_ok() {
+                if tx_res.unwrap().status.confirmed == true {
+                    break;
+                }
             }
-            debug!("retrying in 10 seconds...");
+
+            if chrono::Local::now() - start > delta {
+                Err(Timeout)?
+            }
+
+
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            debug!("retrying in 30 seconds...");
         }
 
         Ok(())
@@ -263,12 +301,23 @@ struct Result {
     data: Value,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, Serialize)]
 pub struct ApiTransaction {
+    txid: String,
     vout: Vec<ApiVout>,
+    status: TXStatus,
+    vsize: u64,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TXStatus {
+    confirmed: bool,
+    block_height: u64,
+    block_hash: String,
+    block_time: u64,
+}
+
+#[derive(Debug, serde::Deserialize, Serialize)]
 pub struct ApiVout {
     value: u64,
 }

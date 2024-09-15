@@ -1,6 +1,7 @@
 #![feature(async_closure)]
+#![feature(error_in_core)]
+
 mod client;
-pub mod init;
 mod util;
 
 use std::str::FromStr;
@@ -9,19 +10,19 @@ use anyhow::anyhow;
 use argh::FromArgs;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Amount, PrivateKey, Transaction, Txid};
-use log::{debug, error, info, LevelFilter};
+use bitcoin::key::UntweakedPublicKey;
+use log::{debug, error, info, warn, LevelFilter};
 use ord_rs::wallet::{
     CreateCommitTransactionArgsV2, RevealTransactionArgs, SignCommitTransactionArgs, TaprootKeypair,
 };
 use ord_rs::{Brc20, OrdTransactionBuilder, Utxo};
 use tokio::time::sleep;
 use client::Network;
-use crate::client::{get_cur_tx_fee, get_max_brc20_tx_fee, RpcClient};
+use crate::client::{get_cur_tx_fee, get_max_brc20_tx_fee, RpcClient, Timeout, API_KEY, MAX_COMMIT_FEE, MAX_REVEAL_FEE};
 use crate::util::async_must;
 
 use clap::{arg, value_parser, Arg, ArgAction, ArgMatches, Command};
 use serde::de::Unexpected::Str;
-use crate::init::API_KEY;
 
 fn cli() -> Command {
     Command::new("inscript")
@@ -29,6 +30,8 @@ fn cli() -> Command {
         .arg(Arg::new("private-key").required(true))
         .arg(Arg::new("ticker").required(true))
         .arg(Arg::new("amount").value_parser(value_parser!(u64)).required(true))
+
+        .arg(Arg::new("max-fee").value_parser(value_parser!(usize)).default_value("1000"))
         .arg(Arg::new("num").long("num").value_parser(value_parser!(i32)).default_value("0"))
         .arg(Arg::new("log").long("log").default_value("INFO").env("RUST_LOG"))
         .arg(Arg::new("network").long("network").default_value("mainnet"))
@@ -57,6 +60,10 @@ async fn inscript_command(cmd: &mut ArgMatches) -> anyhow::Result<()> {
     let network_str = cmd.get_one::<String>("network").unwrap();
     let log = cmd.get_one::<String>("log").unwrap();
 
+    let max_fee = *cmd.get_one::<usize>("max-fee").unwrap();
+
+    unsafe { MAX_FEE = max_fee }
+
     env_logger::builder().filter_level(LevelFilter::from_str(log).unwrap()).try_init().unwrap();
 
     unsafe { API_KEY.set(api_key.to_string()); }
@@ -64,14 +71,24 @@ async fn inscript_command(cmd: &mut ArgMatches) -> anyhow::Result<()> {
 
     let private_key = PrivateKey::from_wif(private_str).unwrap();
     let public_key = private_key.public_key(&Secp256k1::new());
-    let sender_address = Address::p2wpkh(&public_key, bitcoin::Network::Bitcoin).unwrap();
+    let sender_address=Address::p2wpkh(&public_key,bitcoin::Network::Bitcoin).unwrap();
 
+   // let public_key = UntweakedPublicKey::from(public_key);
+    //let sender_address = Address::p2tr(&Secp256k1::new(), public_key, None, bitcoin::Network::Bitcoin);
+
+
+    println!("钱包: {}", &sender_address);
+    println!("铭文: {}", ticker);
+    println!("amount: {}", amount);
+    println!("最大gas费: {}", max_fee);
+    println!("次数: {}", count);
+    println!("网络: {}", network_str);
+    println!("日志级别: {}", log);
 
     // let private_str = "KzG2r2WaPusgRxVCm2imqc2F487mvSkzYEBkSBqh7nQiZyLK514w";
     // let ticker = "helloBTC000";
     // let amount = 10;
     // let network = Network::Testnet;
-
 
     let utxos = RpcClient::get_utxo_by_address(sender_address.clone(), network).await?;
     debug!("address: {}, utxos: {:?}", &sender_address, &utxos);
@@ -88,21 +105,16 @@ async fn inscript_command(cmd: &mut ArgMatches) -> anyhow::Result<()> {
     }
 
 
-    println!("wallet: {}", &sender_address);
-    println!("ticker: {}", ticker);
-    println!("amount: {}", amount);
-    println!("num: {}", count);
     println!("best_utxo: {:?}", &best_utxo);
-    println!("network: {}", network_str);
-    println!("log_level: {}", log);
+
 
     let utxo = utxos.get(0).unwrap();
     let mut inputs = vec![(best_utxo.id.clone(), best_utxo.index)];
 
-    let end = if count == 0 { 0 } else { count };
+    let end = if count == 0 { i32::MAX } else { count };
 
     for _ in 0..end {
-        let next_input = inscript(network, &inputs, private_str, ticker, amount).await?;
+        let next_input = inscript(network, &inputs, private_str, sender_address.clone(), ticker, amount).await?;
         inputs = vec![next_input];
     }
 
@@ -110,81 +122,109 @@ async fn inscript_command(cmd: &mut ArgMatches) -> anyhow::Result<()> {
 }
 
 
-async fn inscript(network: Network, inputs: &Vec<(Txid, u32)>, private_key: &str, ticker: &str, amount: u64) -> anyhow::Result<(Txid, u32)> {
-    let (commit_transaction, reveal_transaction) = new_brc20_tx(network, inputs, private_key, ticker, amount).await;
+pub static mut MAX_FEE: usize = 0;
 
-    let mut i = 0;
+async fn inscript(network: Network, inputs: &Vec<(Txid, u32)>, private_key: &str, addr: Address, ticker: &str, amount: u64) -> anyhow::Result<(Txid, u32)> {
+    let mut fee_level = 0;
+    let max_fee = unsafe {
+        MAX_FEE
+    };
     loop {
-        let bt_res = RpcClient::broadcast_transaction(&commit_transaction, network).await;
-        if bt_res.is_err() {
+        let fees = async_must(|| async { get_cur_tx_fee(network).await }).await;
+        fee_level += 1;
+        let mut fee = match fee_level {
+            1 => fees.economy_fee,
+            2 => fees.fastest_fee,
+            _ => max_fee,
+        };
+
+        fee = if fee > max_fee { max_fee } else { fee };
+
+        let (commit_transaction, reveal_transaction) = new_brc20_tx(network, inputs, private_key, addr.clone(), ticker, amount, fee).await;
+
+        let mut i = 0;
+        loop {
+            let bt_res = RpcClient::broadcast_transaction(&commit_transaction, network).await;
+            if bt_res.is_err() {
+                i += 1;
+                if i > 10 {
+                    bt_res?;
+                }
+
+                sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+
+            let tx_id = bt_res.unwrap();
+            if tx_id != commit_transaction.txid() {
+                return Err(anyhow::anyhow!(
+            "unexpected commit_transaction txid: {}, need: {}",tx_id,commit_transaction.txid()
+            ));
+            }
+
+            break;
+        }
+
+        let wait: u64 = if fee == max_fee {
+            99999999
+        } else {
+            600
+        };
+
+        let result = RpcClient::wait_for_tx(&commit_transaction.txid(), network, Duration::from_secs(wait)).await;
+        if let Err(e) = &result {
+            if e.downcast_ref::<Timeout>().is_some() {
+                warn!("waited too long. raise fee and try again");
+                continue;
+            }
+        }
+
+        result?;
+
+        let mut i = 0;
+        loop {
+            let result = RpcClient::broadcast_transaction(&reveal_transaction, network).await;
+            if result.is_ok() {
+                let tx_id = result.unwrap();
+                if tx_id != reveal_transaction.txid() {
+                    return Err(anyhow::anyhow!(
+            "unexpected reveal_transaction txid: {}, need: {}",tx_id,reveal_transaction.txid()
+                ));
+                }
+
+                info!("new a brc-20 ticker: {}, txid: {}",ticker,tx_id);
+                break;
+            }
+
             i += 1;
             if i > 10 {
-                bt_res?;
+                result?;
             }
 
             sleep(Duration::from_secs(10)).await;
             continue;
         }
 
-        let tx_id = bt_res.unwrap();
-        if tx_id != commit_transaction.txid() {
-            return Err(anyhow::anyhow!(
-            "unexpected commit_transaction txid: {}, need: {}",tx_id,commit_transaction.txid()
-            ));
-        }
-
-        break;
+        return Ok((commit_transaction.txid(), 1));
     }
-
-    RpcClient::wait_for_tx(&commit_transaction.txid(), network, Duration::from_secs(10)).await?;
-
-    let mut i = 0;
-    loop {
-        let result = RpcClient::broadcast_transaction(&reveal_transaction, network).await;
-        if result.is_ok() {
-            let tx_id = result.unwrap();
-            if tx_id != reveal_transaction.txid() {
-                return Err(anyhow::anyhow!(
-            "unexpected reveal_transaction txid: {}, need: {}",tx_id,reveal_transaction.txid()
-                ));
-            }
-
-            info!("new a brc-20 ticker: {}, txid: {}",ticker,tx_id);
-            break;
-        }
-
-        i += 1;
-        if i > 10 {
-            result?;
-        }
-
-        sleep(Duration::from_secs(10)).await;
-        continue;
-    }
-
-    Ok((commit_transaction.txid(), 1))
 }
 
 
-async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: &str, ticker: &str, amount: u64) -> (Transaction, Transaction) {
+async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: &str, addr: Address, ticker: &str, amount: u64, fee: usize) -> (Transaction, Transaction) {
     const script_type: &str = "p2tr";
 
     let ticker = ticker.to_string();
     let amount = amount;
     let private_key = PrivateKey::from_wif(private_key).unwrap();
-    let public_key = private_key.public_key(&Secp256k1::new());
-    let sender_address = Address::p2wpkh(&public_key, bitcoin::Network::Bitcoin).unwrap();
 
 
-    let max_fee = get_max_brc20_tx_fee(network);
-    let (mut commit_fee, mut reveal_fee) = (max_fee.commit_fee, max_fee.reveal_fee);
+    let oneBtc = Amount::from_sat(2500);
+    let (mut commit_fee, mut reveal_fee) = (oneBtc, oneBtc);
 
-    let fees = async_must(|| async { get_cur_tx_fee(network).await }).await;
-    let base_fee = fees.economy_fee;
+
     let inputs = async_must(|| async { RpcClient::sats_amount_from_tx_inputs(inputs, network).await }).await;
 
-    let mut i = 0;
-    loop {
+    for i in 0..2 {
         let mut builder = match script_type {
             "p2tr" | "P2TR" => OrdTransactionBuilder::p2tr(private_key),
             "p2wsh" | "P2WSH" => OrdTransactionBuilder::p2wsh(private_key),
@@ -197,8 +237,8 @@ async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: 
             CreateCommitTransactionArgsV2 {
                 inputs: inputs.clone(),
                 inscription: Brc20::mint(&ticker, amount),
-                txin_script_pubkey: sender_address.script_pubkey(),
-                leftovers_recipient: sender_address.clone(),
+                txin_script_pubkey: addr.script_pubkey(),
+                leftovers_recipient: addr.clone(),
                 commit_fee,
                 reveal_fee,
                 taproot_keypair: Some(TaprootKeypair::Random),
@@ -211,7 +251,7 @@ async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: 
                 commit_tx.unsigned_tx,
                 SignCommitTransactionArgs {
                     inputs: inputs.clone(),
-                    txin_script_pubkey: sender_address.script_pubkey(),
+                    txin_script_pubkey: addr.script_pubkey(),
                     derivation_path: None,
                 },
             )
@@ -227,7 +267,7 @@ async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: 
                     index: 0,
                     amount: commit_tx.reveal_balance,
                 },
-                recipient_address: sender_address.clone(),
+                recipient_address: addr.clone(),
                 redeem_script: commit_tx.redeem_script,
             })
             .await.unwrap();
@@ -236,18 +276,14 @@ async fn new_brc20_tx(network: Network, inputs: &Vec<(Txid, u32)>, private_key: 
             return (signed_commit_tx, reveal_transaction);
         };
 
-        let good_commit_fee = signed_commit_tx.vsize() * base_fee;
-        if good_commit_fee < commit_fee.to_sat() as usize {
-            commit_fee = Amount::from_sat(good_commit_fee as u64);
-        }
+        debug!("commit_vsize: {}",signed_commit_tx.vsize());
+        debug!("reveal_vsize: {}",reveal_transaction.vsize());
 
-        let good_reveal_fee = reveal_transaction.vsize() * base_fee;
-        if good_reveal_fee < reveal_fee.to_sat() as usize {
-            reveal_fee = Amount::from_sat(good_reveal_fee as u64);
-        }
-
-        i += 1;
+        commit_fee = Amount::from_sat((signed_commit_tx.vsize() * fee) as u64);
+        reveal_fee = Amount::from_sat((reveal_transaction.vsize() * fee) as u64);
     }
+
+    unreachable!()
 }
 
 
