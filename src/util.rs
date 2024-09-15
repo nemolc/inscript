@@ -29,7 +29,7 @@ where
         match res {
             Ok(data) => return data,
             Err(e) => {
-                warn!("{}", e);
+                warn!("err: {}", e);
                 time::sleep(Duration::from_secs(10)).await
             }
         }

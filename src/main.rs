@@ -146,10 +146,14 @@ async fn inscript(network: Network, inputs: &Vec<(Txid, u32)>, private_key: &str
         loop {
             let bt_res = RpcClient::broadcast_transaction(&commit_transaction, network).await;
             if bt_res.is_err() {
+                let err=bt_res.unwrap_err();
+                error!("broadcast commit transaction. err: {}",&err);
+
                 i += 1;
                 if i > 10 {
-                    bt_res?;
+                    Err(err)?;
                 }
+
 
                 sleep(Duration::from_secs(10)).await;
                 continue;
