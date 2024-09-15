@@ -31,7 +31,7 @@ fn cli() -> Command {
         .arg(Arg::new("ticker").required(true))
         .arg(Arg::new("amount").value_parser(value_parser!(u64)).required(true))
 
-        .arg(Arg::new("max-fee").value_parser(value_parser!(usize)).default_value("1000"))
+        .arg(Arg::new("max-fee").long("max-fee").value_parser(value_parser!(usize)).default_value("1000"))
         .arg(Arg::new("num").long("num").value_parser(value_parser!(i32)).default_value("0"))
         .arg(Arg::new("log").long("log").default_value("INFO").env("RUST_LOG"))
         .arg(Arg::new("network").long("network").default_value("mainnet"))
